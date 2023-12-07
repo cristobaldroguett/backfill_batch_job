@@ -56,10 +56,11 @@ if __name__ == '__main__':
         print(f"error: Failed to connect to OpenSearch: {str(e)}")
 
     #Get the start and end time
-    startTime = datetime.now() - timedelta(minutes=int(timeframe))#Uncomment when this task is running in ECS on scheduler
-    #startTime = datetime(2023,12,4,15,00)
-    endTime = datetime.now()
-    #endTime = datetime(2023,12,4,15,15)
+    #startTime = datetime.utcnow() - timedelta(minutes=int(timeframe))#Uncomment when this task is running in ECS on scheduler
+    startTime = datetime(2023,12,4,18,45)
+    #endTime = datetime.utcnow()
+    #utctime = datetime.utcnow()
+    endTime = datetime(2023,12,4,19,00)
     print("Start and End Times are " + str(startTime) + " and " + str(endTime))
 
     # First Query - Find the amount of distinct devices in this time span
@@ -156,7 +157,8 @@ if __name__ == '__main__':
     deviceslist = []
     indexlist = []
     for devices in snap_result['aggregations']['distinct_devices']['buckets']:
-        deviceslist.append(devices['key']['device'])
+        if devices['key']['device'] not in deviceslist:
+            deviceslist.append(devices['key']['device'])
         if devices['key']['index'] not in indexlist:
             indexlist.append(devices['key']['index'])
 
@@ -203,10 +205,11 @@ if __name__ == '__main__':
             print(f"There were no results for those parameters: {str(e)}")
 
         for devices in snap_result['aggregations']['distinct_devices']['buckets']:
-            deviceslist.append(devices['key']['device'])
+            if devices['key']['device'] not in deviceslist:
+                deviceslist.append(devices['key']['device'])
             if devices['key']['index'] not in indexlist:
                 indexlist.append(devices['key']['index'])
-
+    beforedevicelist = deviceslist
     #Code for tracking record and device totals
     total_devices = len(deviceslist)
     total_records = 0
@@ -219,9 +222,11 @@ if __name__ == '__main__':
         else:
             indexes += index
 
-    # Do another loop to insert each 1000 batch until deviceslist is empty
+    # Do another loop to insert each 100 batch until deviceslist is empty
+    afterindexlist = []
+    afterdevicelist = []
     while len(deviceslist) > 1:
-        # We have devices list and need to build and query with 1000 names
+        # We have devices list and need to build and query with 100 names
         triggered = False
         query_string = ""
         currentdeviceslist = deviceslist[:100]
@@ -232,7 +237,7 @@ if __name__ == '__main__':
                 query_string = query_string + " OR name.value.keyword:" + str(names)
             triggered = True
 
-        #Now that we have the query for first 1000 we need to do the real aggregation
+        #Now that we have the query for first 100 we need to do the real aggregation
         must_string = [
             {
                 "query_string": {
@@ -343,18 +348,27 @@ if __name__ == '__main__':
             for frame in aggregation[intervalname]['buckets']:
                 if frame["latest_record"]["hits"]["hits"] != []:
                     result.append(frame["latest_record"]["hits"]["hits"])
+                    if frame["latest_record"]["hits"]["hits"][0]['_index'] not in afterindexlist:
+                        afterindexlist.append(frame["latest_record"]["hits"]["hits"][0]['_index'])
+                    if frame["latest_record"]["hits"]["hits"][0]['_source']['name']['value'] not in afterdevicelist:
+                        afterdevicelist.append(frame["latest_record"]["hits"]["hits"][0]['_source']['name']['value'])
+
         total_records += len(result)
 
         #We have the aggregated records at 3 min cadence so now we need to insert to snapshot index
         bulk_data = []
         batch_size = 1000
+        resultsize = len(result)
         for record in result:
-            final_record = record
+            #final_record = record
 
-            if final_record:
-                bulk_data.append(final_record[0])
+            #if final_record:
+            #    bulk_data.append(final_record[0])
+            if record[0] != []:
+                bulk_data.append(record[0])
 
-            if len(bulk_data) >= batch_size or len(bulk_data) >= len(result):
+            ### Case where result is less than batch size###
+            if len(bulk_data) >= len(result):
                 actions = []
                 for entry in bulk_data:
                     index_name = entry['_index'][:26] + entry['_index'][35:]
@@ -377,6 +391,33 @@ if __name__ == '__main__':
                         print(f"Error: {item['index']['error']}")
                 bulk_data = []
 
+            ### Case where result is more than than batch size###
+            if len(bulk_data) >= batch_size or len(bulk_data) >= resultsize:
+                actions = []
+                for entry in bulk_data:
+                    index_name = entry['_index'][:26] + entry['_index'][35:]
+                    # time.sleep(0.01)
+                    action = {
+                        "_op_type": "index",
+                        "_index": index_name,  # index_name,
+                        "_id": entry['_id'],
+                        "_source": entry['_source'],
+                    }
+                    actions.append(action)
+                    # print("Index name is" + str(index_name))
+
+                success, failed = helpers.bulk(opensearch, actions)
+
+                # Subtract 1,000 from total result size
+                resultsize -= batch_size
+
+                # print("We added a record into the index")
+                if failed:
+                    print(f"Failed to insert {len(failed)} documents")
+                    for item in failed:
+                        print(f"Error: {item['index']['error']}")
+                bulk_data = []
+
         #Print after each batch was inserted
         print("An insertion was completed")
 
@@ -388,6 +429,13 @@ if __name__ == '__main__':
 
     #print("Length of device list at the end is " + str(deviceslist))
     totaltime = datetime.now()
+    if total_devices != len(afterdevicelist):
+        print('### ATTENTION ### The amount of devices received and inserted do not match')
+        print('The amount of devices initially:' + str(total_devices))
+        print('The amount of devices inserted: ' + str(len(afterdevicelist)))
+        for x in range(total_devices):
+            if beforedevicelist[x] not in afterdevicelist:
+                print("Device " + beforedevicelist[x] + " is not in the after device list ")
     print("Time from start to end: " + str(totaltime - entrytime) + " seconds")
     print("In total we inserted " + str(total_records) + " records into the snapshot index")
 
